@@ -1,0 +1,377 @@
+#!/usr/bin/bash
+
+: ${_alias_completion_print_messages=no}
+
+_alias_completion_msg_need_newline=no
+_alias_completion_msg() {
+    if [[ $_alias_completion_print_messages = yes ]]; then
+        if [[ $_alias_completion_msg_need_newline = yes ]]; then
+            printf >&2 '\n'
+            _alias_completion_msg_need_newline=no
+        fi
+        printf >&2 'alias-completion: '"$1"'\n' "${@:2}"
+    fi
+}
+
+_alias_completion_make_character_class() {
+    local set=$1
+    local c
+    local i
+    result=''
+    for (( i = 0; i < ${#set}; ++i )); do
+        c=${set:$i:1}
+        if [[ $c = [\[\]\-\^\\] ]]; then
+            result="$result\\$c"
+        else
+            result="$result$c"
+        fi
+    done
+    return 0
+}
+
+#
+# Split a string into words the same way the Bash completion
+# code does; delimiters come from COMP_WORDBREAKS.  On success,
+# aresult contains the split words.
+#
+# N.B. readline splitting _preserved_ quotation marks, backslashes,
+# and so on in the split words, so we can't just set IFS, use bash's
+# built-in word splitting, and call it a day.  Instead, we parse by
+# hand. Isn't this fun?
+#
+# $1 - string to split
+# $2 - wordbreak characters
+#
+_alias_completion_split_like_readline() {
+    _alias_completion_make_character_class "$2"
+    local word_break_pattern="[$result]"
+
+    local ws_pattern=$'[ \t]'
+    local ts=$1
+    local state=ws
+    local -a words=()
+    local word_start=
+
+    local i
+    for (( i = 0; i <= ${#ts}; ++i )); do
+        local c=${ts:$i:1}
+        local is_delim=0
+        local is_ws=0
+        if [[ $c = $word_break_pattern ]]; then
+            is_delim=1
+        fi
+        if [[ $c = $ws_pattern ]] || [[ $c = '' ]]; then
+            is_ws=1
+        fi
+
+        _alias_completion_msg \
+            'c:[%s] is_delim:[%s] is_ws:[%s] state:[%s]' \
+            "$c" "$is_delim" "$is_ws" "$state"
+
+        case "$state" in
+            ws)
+                if ((is_ws)); then
+                    true;
+                elif [[ $c = '"' ]]; then
+                    state=word-doubleq
+                elif [[ $c = '\' ]]; then
+                    state=word-singleq
+                elif ((is_delim)); then
+                    state=delim
+                else
+                    state=word
+                fi
+
+                if ! [[ $state = 'ws' ]]; then
+                    word_start=$i
+                fi
+                ;;
+            delim)
+                if ((is_ws)); then
+                    state=ws
+                elif ((!is_delim)); then
+                    state=word
+                fi
+
+                if [[ $state != 'delim' ]]; then
+                    local word_length=$((i-word_start))
+                    local word="${ts:$word_start:$word_length}"
+                    words+=("$word")
+                    word_start=$i
+                fi
+
+                ;;
+            # N.B. readline knows about single and double quoting, but
+            # knows nothing about $'' C literal quoting!
+            word)
+                if [[ $c = '"' ]]; then
+                    state=word-doubleq
+                elif [[ $c = "'" ]]; then
+                    state=word-singleq
+                elif [[ $c = '\' ]]; then
+                    state=word-backslash
+                elif ((is_ws)); then
+                    state=ws
+                elif ((is_delim)); then
+                    state=delim
+                fi
+
+                if [[ $state = 'delim' ]] || [[ $state = 'ws' ]]; then
+                    local word_length=$((i-word_start))
+                    local word="${ts:$word_start:$word_length}"
+                    words+=("$word")
+                    word_start=$i
+                fi
+                ;;
+            word-backslash)
+                state=word
+                ;;
+            word-doubleq)
+                if [[ $c == '\' ]]; then
+                    state=word-doubleq-backslash
+                elif [[ $c == '"' ]]; then
+                    state=word
+                else
+                    true
+                fi
+                ;;
+            word-doubleq-backslash)
+                state=word-doubleq
+                ;;
+            *)
+                _alias_completion_msg \
+                    'internal error: unknown state [%s]' \
+                    "$state"
+                return 1
+            ;;
+        esac
+        if [[ $state = word-* ]] && [[ $c = '' ]]; then
+            local word_length=$((i-word_start))
+            local word="${ts:$word_start:$word_length}"
+            words+=("$word")
+        fi
+    done
+    aresult=("${words[@]}")
+}
+
+# Parse a completion specification given as argument words.
+# On success, aresult contains the parsed option words and result
+# contains the number of those that are options.
+
+_alias_complete_parse_complete_command() {
+    local OPTIND=1
+    local c=
+    aresult=()
+    while getopts ":+abcdefgjksuvo:DEA:G:W:F:C:X:P:S:" c; do
+        case "$c" in
+            '?')
+                _alias_completion_msg 'invalid option %s' "$OPTARG"
+                return 1
+                ;;
+            ':')
+                _alias_completion_msg \
+                    'missing argument for option %s' "$OPTARG"
+                return 1
+                ;;
+            [oAGWFCXPS])
+                aresult+=("-$c" "$OPTARG")
+                ;;
+            *)
+                aresult+=("-$c")
+                ;;
+        esac
+    done
+    result="${#aresult[@]}"
+    shift $((OPTIND-1))
+    aresult+=("$@")
+    return 0
+}
+
+# Find completion information for a given command, $1.  On success,
+# completion options are in aresult; the command being completed
+# is stripped.
+_alias_completion_find_completer() {
+    local line
+    local i
+    local cmd=$1
+    local -a argwords=()
+    while read -r line; do
+        eval "argwords=($line)"
+        if ! [[ ${argwords[0]} = 'complete' ]]; then
+            _alias_completion_msg 'invalid completion line [%s]' "$line"
+            continue
+        fi
+        if ! _alias_complete_parse_complete_command "${argwords[@]:1}"
+        then
+            continue
+        fi
+
+        local cmds=("${aresult[@]:$result}")
+
+        _alias_completion_msg \
+            'considering completion information for [%s]' "${cmds[*]}"
+
+        for (( i = result; i < ${#aresult[@]}; ++i )); do
+            if [[ "${aresult[$i]}" = "$cmd" ]]; then
+                aresult=("${aresult[@]:0:$result}")
+                return 0
+            fi
+        done
+    done < <(complete -p)
+    _alias_completion_msg \
+        'no completion information found for [%s]' \
+        "$cmd"
+    return 1
+}
+
+# Find the definition of an alias.  Alias name in $1; result in
+# $result on success.
+_alias_complete_find_alias() {
+    local line=
+    local aliaspat="alias $1='"
+    local aliasline=
+    while read -r line; do
+        if [[ $line = $aliaspat* ]]; then
+            aliasline=$line
+            break
+        fi
+    done < <(alias -p)
+
+    if [[ -z $aliasline ]]; then
+        _alias_completion_msg \
+            'no alias definition found for [%s]' "$compcmd"
+        return 1
+    fi
+
+    eval "result=${aliasline/*=/}"
+    return 0
+}
+
+#
+# Complete an alias.
+#
+# $1 is the name of the command being completed
+# $2 is the word being completed
+# $3 is the prior word
+#
+_alias_complete() {
+    local _alias_completion_msg_need_newline=yes
+    local -a aresult
+    local result=
+    local compcmd=$1
+    local compword=$2
+    local prevword=$3
+    local i
+
+    if ! _alias_complete_find_alias "$compcmd"; then
+        return 1
+    fi
+    local aliasdef=$result
+    _alias_completion_split_like_readline \
+        "$aliasdef" "$COMP_WORDBREAKS"
+    local -a alias_comp_words=("${aresult[@]}")
+    COMP_WORDS=("${alias_comp_words[@]}" "${COMP_WORDS[@]:1}")
+    let COMP_CWORD+=${#alias_comp_words[@]}
+    let COMP_CWORD-=1
+
+    local compopts
+    compopts=$(compopt -- "${COMP_WORDS[0]}" 2>/dev/null)
+    if (( $? != 0 )); then
+        return $?
+    fi
+
+    local -a acompopts
+    eval "acompopts=($compopts)"
+    if [[ ${acompopts[0]} != 'compopt' ]] || \
+           [[ ${acompopts[$((${#acompopts[@]}-1))]} \
+                  != "${COMP_WORDS[0]}" ]];
+    then
+        _alias_completion_msg \
+            'unexpected compopt command line [%s]' \
+            "$compopts"
+        return 1
+    fi
+
+    acompopts=("${acompopts[@]:1:$((${#acompopts[@]}-2))}")
+    compopt "${acompopts[@]}"
+
+    if ! _alias_completion_find_completer "${COMP_WORDS[0]}"; then
+        return 1
+    fi
+
+    local comp_function=
+    local comp_command=
+    for (( i = 0; i < ${#aresult[@]}; ++i )); do
+        if [[ ${aresult[$i]} == '-F' ]]; then
+            comp_function=${aresult[$((i+1))]}
+            let i++
+        elif [[ ${aresult[$i]} == '-C' ]]; then
+            comp_command=${aresult[$((i+1))]}
+            let i++
+        fi
+    done
+
+    COMPREPLY=()
+
+    if [[ -n $comp_function ]]; then
+        if ! "$comp_function" \
+             "${COMP_WORDS[0]}" \
+             "${COMP_WORDS[$((COMP_CWORD-1))]}" \
+             "${COMP_WORDS[$((COMP_CWORD-2))]}"; then
+            return $?
+        fi
+    fi
+
+    if [[ -n $comp_command ]]; then
+        local completion
+        while read -r completion; do
+            COMPREPLY+=("$completion")
+        done < <( "$comp_command" \
+                      "${COMP_WORDS[0]}" \
+                      "${COMP_WORDS[$((COMP_CWORD-1))]}" \
+                      "${COMP_WORDS[$((COMP_CWORD-2))]}" )
+    fi
+
+    return 0
+}
+
+# Generic completer that tries to set up completion for any alias
+# it finds.
+_alias_completion_generic() {
+    local _alias_completion_msg_need_newline=yes
+    local result=
+    local -a aresult=()
+    local compcmd=$1
+    if ! _alias_complete_find_alias "$compcmd"; then
+        return 1
+    fi
+    local aliasdef=$result
+    _alias_completion_split_like_readline \
+        "$aliasdef" "$COMP_WORDBREAKS"
+    local -a alias_comp_words=("${aresult[@]}")
+
+    if ! _alias_completion_find_completer "${alias_comp_words[0]}"; then
+        return 1
+    fi
+
+    local -a compspec_args=()
+    local i
+
+    for (( i = 0; i < ${#aresult[@]}; ++i )); do
+        case "${aresult[$i]}" in
+            -F|-C)
+                let i++
+                ;;
+            *)
+                compspec_args+=("${aresult[$i]}")
+                ;;
+            esac
+    done
+
+    local funcname="_alias_completion_complete_$compcmd"
+    eval "$funcname() { _alias_complete \"\$@\"; }"
+    complete "${compspec_args[@]}" -F "$funcname" "$compcmd"
+    return 124
+}
+
+complete -D -o default -o bashdefault -F _alias_completion_generic
