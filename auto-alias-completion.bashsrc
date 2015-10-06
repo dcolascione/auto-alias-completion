@@ -368,9 +368,7 @@ _alias_completion_generic() {
             esac
     done
 
-    local funcname="_alias_completion_complete_$compcmd"
-    eval "$funcname() { _alias_complete \"\$@\"; }"
-    complete "${compspec_args[@]}" -F "$funcname" "$compcmd"
+    complete "${compspec_args[@]}" -F _alias_complete "$compcmd"
     return 124
 }
 
