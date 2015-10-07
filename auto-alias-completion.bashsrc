@@ -243,7 +243,7 @@ _alias_complete_find_alias() {
         return 1
     fi
 
-    eval "result=${aliasline/*=/}"
+    eval "result=${aliasline%*=}"
     return 0
 }
 
